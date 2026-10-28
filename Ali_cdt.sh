@@ -1,10 +1,10 @@
 cat << 'EOF' > /root/cdt.sh
 #!/usr/bin/env bash
-# ======================================================================================
-# CDT-Management 一键 Docker 部署 / 备份 / 无损更新管理脚本 (循环菜单增强版)
+# ==================================================================================
+# CDT-Management 一键 Docker 部署 / 备份 / 无损更新管理脚本 (自动保留3份备份版)
 # 适用项目: https://github.com/BeacherZ/cdt-management
 # 默认宿主机端口: 12333
-# ======================================================================================
+# ==================================================================================
 
 set -e
 
@@ -13,6 +13,7 @@ APP_NAME="cdt-management"
 INSTALL_DIR="/opt/docker/${APP_NAME}"
 BACKUP_DIR="/opt/docker/${APP_NAME}-backups"
 HOST_PORT="12333"
+MAX_BACKUPS=3
 
 # 颜色输出
 RED='\033[0;31m'
@@ -36,6 +37,22 @@ fi
 pause_back() {
     echo ""
     read -rp "按回车键 (Enter) 返回主菜单..." _
+}
+
+# 自动清理旧备份，仅保留最新的 MAX_BACKUPS (3) 份
+clean_old_backups() {
+    mkdir -p "${BACKUP_DIR}"
+    mapfile -t all_backups < <(ls -1t "${BACKUP_DIR}"/${APP_NAME}_backup_*.tar.gz 2>/dev/null || true)
+    local total=${#all_backups[@]}
+
+    if (( total > MAX_BACKUPS )); then
+        info "检测到当前共有 ${total} 份备份，正在清理旧备份（仅保留最新 ${MAX_BACKUPS} 份）..."
+        for (( i=MAX_BACKUPS; i<total; i++ )); do
+            rm -f "${all_backups[$i]}"
+            info "已删除旧备份: $(basename "${all_backups[$i]}")"
+        done
+        ok "旧备份清理完成！当前保留最新 ${MAX_BACKUPS} 份备份。"
+    fi
 }
 
 # 1. 环境检查与依赖安装
@@ -145,15 +162,15 @@ install_app() {
     local ip
     ip=$(curl -fsSL -4 ip.sb 2>/dev/null || hostname -I | awk '{print $1}')
     echo ""
-    ok "================================================================"
+    ok "============================================================"
     ok " CDT-Management 安装成功！"
     ok " 访问地址: http://${ip}:${HOST_PORT}"
     ok " 安装目录: ${INSTALL_DIR}"
-    ok " 备份目录: ${BACKUP_DIR}"
-    ok "================================================================"
+    ok " 备份目录: ${BACKUP_DIR} (最多保留 ${MAX_BACKUPS} 份)"
+    ok "============================================================"
 }
 
-# 5. 备份数据（支持手动备份与更新前自动备份）
+# 5. 备份数据（支持手动备份与更新前自动备份 + 自动保留最新3份）
 backup_data() {
     local tag="${1:-manual}"
     if [[ ! -d "${INSTALL_DIR}" ]]; then
@@ -171,6 +188,9 @@ backup_data() {
 
     ok "数据备份完成！备份文件路径: ${backup_file}"
     ls -lh "${backup_file}"
+
+    # 每次备份完成后自动清理超出的旧备份
+    clean_old_backups
 }
 
 # 6. 无损更新（自动备份 -> 保护持久化数据 -> 拉取更新 -> 恢复端口 -> 重建容器）
@@ -209,9 +229,9 @@ update_app() {
     start_containers
     docker image prune -f >/dev/null 2>&1 || true
 
-    ok "================================================================"
+    ok "============================================================"
     ok " CDT-Management 已成功更新至最新版本，所有数据完好保留！"
-    ok "================================================================"
+    ok "============================================================"
 }
 
 # 7. 还原数据备份
@@ -224,7 +244,7 @@ restore_data() {
         return
     fi
 
-    echo -e "\n${CYAN}可用的备份列表（按时间从新到旧）：${NC}"
+    echo -e "\n${CYAN}可用的备份列表（按时间从新到旧，最多保留 ${MAX_BACKUPS} 份）：${NC}"
     for i in "${!backups[@]}"; do
         echo "  [$((i+1))] $(basename "${backups[$i]}") ($(du -h "${backups[$i]}" | awk '{print $1}'))"
     done
@@ -296,25 +316,30 @@ uninstall_app() {
 
 # 循环主菜单界面
 show_menu() {
+    # 启动菜单时自动检查并清理一次多余备份
+    clean_old_backups >/dev/null 2>&1 || true
+
     while true; do
         clear
-        echo -e "${CYAN}==============================================================${NC}"
-        echo -e "${GREEN}           CDT-Management Docker 一键管理脚本                 ${NC}"
-        echo -e "${CYAN}==============================================================${NC}"
+        local cur_backups
+        cur_backups=$(ls -1 "${BACKUP_DIR}"/${APP_NAME}_backup_*.tar.gz 2>/dev/null | wc -l)
+        echo -e "${CYAN}==========================================================${NC}"
+        echo -e "${GREEN}         CDT-Management Docker 一键管理脚本               ${NC}"
+        echo -e "${CYAN}==========================================================${NC}"
         echo -e " 项目地址: ${REPO_URL}"
         echo -e " 安装路径: ${INSTALL_DIR}"
-        echo -e " 备份路径: ${BACKUP_DIR}"
+        echo -e " 备份路径: ${BACKUP_DIR} (当前: ${YELLOW}${cur_backups}/${MAX_BACKUPS}${NC} 份)"
         echo -e " 面板端口: ${YELLOW}${HOST_PORT}${NC}"
-        echo -e "${CYAN}--------------------------------------------------------------${NC}"
+        echo -e "${CYAN}----------------------------------------------------------${NC}"
         echo -e "  ${GREEN}1.${NC} 一键安装部署 (端口 ${HOST_PORT})"
         echo -e "  ${GREEN}2.${NC} 无损更新版本 (自动备份 + 保留全部数据)"
-        echo -e "  ${GREEN}3.${NC} 立即备份数据"
+        echo -e "  ${GREEN}3.${NC} 立即备份数据 (超出 ${MAX_BACKUPS} 份自动删旧)"
         echo -e "  ${GREEN}4.${NC} 从备份恢复数据"
         echo -e "  ${GREEN}5.${NC} 查看运行状态与实时日志"
         echo -e "  ${GREEN}6.${NC} 重启服务"
         echo -e "  ${RED}7.${NC} 卸载服务"
         echo -e "  ${GREEN}0.${NC} 退出脚本"
-        echo -e "${CYAN}==============================================================${NC}"
+        echo -e "${CYAN}==========================================================${NC}"
         read -rp "请输入数字选项 [0-7]: " opt
 
         case "$opt" in
