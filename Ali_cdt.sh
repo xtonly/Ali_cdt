@@ -1,1 +1,320 @@
+cat << 'EOF' > /root/cdt.sh
+#!/usr/bin/env bash
+# ==============================================================================
+# CDT-Management 一键 Docker 部署 / 备份 / 无损更新管理脚本
+# 适用项目: https://github.com/BeacherZ/cdt-management
+# 默认宿主机端口: 12333
+# ==============================================================================
 
+set -e
+
+REPO_URL="https://github.com/BeacherZ/cdt-management.git"
+APP_NAME="cdt-management"
+INSTALL_DIR="/opt/docker/${APP_NAME}"
+BACKUP_DIR="/opt/docker/${APP_NAME}-backups"
+HOST_PORT="12333"
+
+# 颜色输出
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+info()  { echo -e "${CYAN}[INFO]${NC} $1"; }
+ok()    { echo -e "${GREEN}[OK]${NC} $1"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
+err()   { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+
+# 检查 root 权限
+[[ $EUID -ne 0 ]] && err "请使用 root 用户运行此脚本 (sudo -i)"
+
+# 1. 环境检查与依赖安装
+check_env() {
+    if ! command -v git &>/dev/null || ! command -v tar &>/dev/null || ! command -v curl &>/dev/null; then
+        info "正在安装基础依赖 (git, curl, tar)..."
+        if command -v apt-get &>/dev/null; then
+            apt-get update -y && apt-get install -y git curl tar ca-certificates
+        elif command -v yum &>/dev/null; then
+            yum install -y git curl tar ca-certificates
+        elif command -v apk &>/dev/null; then
+            apk add --no-cache git curl tar ca-certificates
+        fi
+    fi
+
+    if ! command -v docker &>/dev/null; then
+        info "未检测到 Docker，正在自动安装 Docker..."
+        curl -fsSL https://get.docker.com | bash
+        systemctl enable --now docker || true
+        ok "Docker 安装完成"
+    fi
+
+    if ! docker compose version &>/dev/null; then
+        err "当前 Docker 版本不支持 'docker compose' (V2)，请升级 Docker 或安装 docker-compose-plugin。"
+    fi
+}
+
+# 2. 自动识别并修改端口为 12333（保持容器内部端口不变）
+apply_port_config() {
+    cd "${INSTALL_DIR}"
+    local compose_file=""
+    for f in "docker-compose.yml" "docker-compose.yaml" "compose.yml" "compose.yaml"; do
+        if [[ -f "$f" ]]; then
+            compose_file="$f"
+            break
+        fi
+    done
+
+    if [[ -n "$compose_file" ]]; then
+        info "检测到配置文件 ${compose_file}，正在将宿主机端口修改为 ${HOST_PORT}..."
+        # 匹配形如 - "xxxx:yyyy" 或 - xxxx:yyyy 或 - 127.0.0.1:xxxx:yyyy，仅替换冒号左侧的宿主机端口为 12333
+        sed -i -E "s/^([[:space:]]*-[[:space:]]*[\"']?)([0-9]+):([0-9]+[\"']?)/\1${HOST_PORT}:\3/g" "$compose_file"
+        ok "端口映射已锁定为宿主机 ${HOST_PORT} 端口"
+    else
+        # 若仓库仅提供 Dockerfile，自动生成标准 docker-compose.yml
+        info "未检测到默认 compose 文件，正在根据 Dockerfile 自动生成 docker-compose.yml..."
+        local internal_port="8080"
+        if [[ -f "Dockerfile" ]]; then
+            local exposed
+            exposed=$(grep -iE '^EXPOSE[[:space:]]+[0-9]+' Dockerfile | awk '{print $2}' | head -n1 || true)
+            [[ -n "$exposed" ]] && internal_port="$exposed"
+        fi
+        mkdir -p "${INSTALL_DIR}/data" "${INSTALL_DIR}/config" "${INSTALL_DIR}/logs"
+        cat <<YML > "${INSTALL_DIR}/docker-compose.yml"
+services:
+  ${APP_NAME}:
+    build: .
+    image: ${APP_NAME}:latest
+    container_name: ${APP_NAME}
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT}:${internal_port}"
+    volumes:
+      - ${INSTALL_DIR}/data:/app/data
+      - ${INSTALL_DIR}/config:/app/config
+      - ${INSTALL_DIR}/logs:/app/logs
+    environment:
+      - TZ=Asia/Shanghai
+YML
+        ok "已生成 docker-compose.yml (端口映射: ${HOST_PORT}:${internal_port})"
+    fi
+}
+
+# 3. 启动或重建容器（优先拉取镜像，失败则本地构建）
+start_containers() {
+    cd "${INSTALL_DIR}"
+    info "正在启动 ${APP_NAME} 容器..."
+    if grep -q "ghcr.io" docker-compose.y*ml compose.y*ml 2>/dev/null; then
+        if ! docker compose pull; then
+            warn "拉取远程镜像失败，尝试使用本地源码构建..."
+            docker compose up -d --build --remove-orphans
+        else
+            docker compose up -d --remove-orphans
+        fi
+    else
+        docker compose up -d --build --remove-orphans
+    fi
+}
+
+# 4. 安装部署
+install_app() {
+    check_env
+    mkdir -p "${BACKUP_DIR}"
+
+    if [[ -d "${INSTALL_DIR}/.git" ]]; then
+        warn "检测到已安装目录 ${INSTALL_DIR}，正在为您转为【无损更新】流程..."
+        update_app
+        return
+    fi
+
+    info "正在拉取项目源码至 ${INSTALL_DIR} ..."
+    mkdir -p "$(dirname "${INSTALL_DIR}")"
+    git clone "${REPO_URL}" "${INSTALL_DIR}"
+
+    apply_port_config
+    start_containers
+
+    local ip
+    ip=$(curl -fsSL -4 ip.sb 2>/dev/null || hostname -I | awk '{print $1}')
+    echo ""
+    ok "========================================================"
+    ok " CDT-Management 安装成功！"
+    ok " 访问地址: http://${ip}:${HOST_PORT}"
+    ok " 安装目录: ${INSTALL_DIR}"
+    ok " 备份目录: ${BACKUP_DIR}"
+    ok "========================================================"
+}
+
+# 5. 备份数据（支持手动备份与更新前自动备份）
+backup_data() {
+    local tag="${1:-manual}"
+    if [[ ! -d "${INSTALL_DIR}" ]]; then
+        err "未找到安装目录 ${INSTALL_DIR}，无法备份！"
+    fi
+
+    mkdir -p "${BACKUP_DIR}"
+    local timestamp
+    timestamp=$(date +"%Y%m%d_%H%M%S")
+    local backup_file="${BACKUP_DIR}/${APP_NAME}_backup_${tag}_${timestamp}.tar.gz"
+
+    info "正在打包备份持久化数据与配置文件..."
+    # 备份整个项目目录（排除 .git 历史对象以减小体积，完整保留 data/config/db/json 等所有数据）
+    tar --exclude="${INSTALL_DIR}/.git" -czf "${backup_file}" -C "$(dirname "${INSTALL_DIR}")" "$(basename "${INSTALL_DIR}")"
+
+    ok "数据备份完成！备份文件路径: ${backup_file}"
+    ls -lh "${backup_file}"
+}
+
+# 6. 无损更新（自动备份 -> 保护持久化数据 -> 拉取更新 -> 恢复端口 -> 重建容器）
+update_app() {
+    check_env
+    if [[ ! -d "${INSTALL_DIR}/.git" ]]; then
+        err "未检测到已安装的 ${INSTALL_DIR}，请先执行【1. 安装部署】。"
+    fi
+
+    info "【第 1/4 步】更新前自动备份当前数据..."
+    backup_data "pre_update"
+
+    info "【第 2/4 步】保护持久化数据目录并同步最新源码..."
+    local tmp_data_dir="/tmp/${APP_NAME}_data_preserve_$$"
+    mkdir -p "${tmp_data_dir}"
+    # 将可能存在的数据库、配置、数据文件夹暂存一份，防止 git reset 覆盖任何已跟踪的同名默认配置
+    cd "${INSTALL_DIR}"
+    for item in data config logs db storage *.db *.sqlite *.sqlite3 *.json .env; do
+        if [[ -e "$item" && "$item" != "package.json" && "$item" != "package-lock.json" ]]; then
+            cp -a "$item" "${tmp_data_dir}/" 2>/dev/null || true
+        fi
+    done
+
+    git fetch --all
+    local branch
+    branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "main")
+    git reset --hard "origin/${branch}"
+
+    # 还原用户的持久化数据与配置
+    cp -af "${tmp_data_dir}/." "${INSTALL_DIR}/" 2>/dev/null || true
+    rm -rf "${tmp_data_dir}"
+
+    info "【第 3/4 步】重新应用 ${HOST_PORT} 端口配置..."
+    apply_port_config
+
+    info "【第 4/4 步】拉取最新镜像并无缝重建容器（挂载数据保持不变）..."
+    start_containers
+    docker image prune -f >/dev/null 2>&1 || true
+
+    ok "========================================================"
+    ok " CDT-Management 已成功更新至最新版本，所有数据完好保留！"
+    ok "========================================================"
+}
+
+# 7. 还原数据备份
+restore_data() {
+    mkdir -p "${BACKUP_DIR}"
+    mapfile -t backups < <(ls -1t "${BACKUP_DIR}"/${APP_NAME}_backup_*.tar.gz 2>/dev/null || true)
+
+    if [[ ${#backups[@]} -eq 0 ]]; then
+        warn "在 ${BACKUP_DIR} 中未找到任何备份文件。"
+        return
+    fi
+
+    echo -e "\n${CYAN}可用的备份列表（按时间从新到旧）：${NC}"
+    for i in "${!backups[@]}"; do
+        echo "  [$((i+1))] $(basename "${backups[$i]}") ($(du -h "${backups[$i]}" | awk '{print $1}'))"
+    done
+
+    read -rp "请输入要恢复的备份序号 [1-${#backups[@]}] (输入 0 取消): " choice
+    if [[ "$choice" == "0" || -z "$choice" ]]; then
+        info "已取消恢复操作。"
+        return
+    fi
+
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#backups[@]} )); then
+        err "无效的序号！"
+    fi
+
+    local selected_backup="${backups[$((choice-1))]}"
+    warn "即将从 $(basename "${selected_backup}") 恢复数据，当前运行状态将被覆盖！"
+    read -rp "确认恢复吗？(y/N): " confirm
+    [[ "${confirm,,}" != "y" ]] && { info "已取消。"; return; }
+
+    if [[ -d "${INSTALL_DIR}" ]]; then
+        cd "${INSTALL_DIR}" && docker compose down 2>/dev/null || true
+    fi
+
+    info "正在解压恢复数据..."
+    tar -xzf "${selected_backup}" -C "$(dirname "${INSTALL_DIR}")"
+    apply_port_config
+    start_containers
+    ok "数据已成功恢复并重新启动服务！"
+}
+
+# 8. 卸载服务
+uninstall_app() {
+    warn "即将停止并移除 ${APP_NAME} 容器。"
+    read -rp "确认卸载容器吗？(y/N): " confirm
+    [[ "${confirm,,}" != "y" ]] && return
+
+    if [[ -d "${INSTALL_DIR}" ]]; then
+        cd "${INSTALL_DIR}" && docker compose down --rmi all 2>/dev/null || true
+    fi
+
+    read -rp "是否在删除安装目录前先执行一次最终数据备份？(Y/n): " do_bak
+    if [[ "${do_bak,,}" != "n" ]]; then
+        backup_data "before_uninstall"
+    fi
+
+    read -rp "是否彻底删除安装目录 ${INSTALL_DIR}（备份目录 ${BACKUP_DIR} 仍会保留）？(y/N): " del_dir
+    if [[ "${del_dir,,}" == "y" ]]; then
+        rm -rf "${INSTALL_DIR}"
+        ok "安装目录已删除。您的历史备份仍安全保留在: ${BACKUP_DIR}"
+    else
+        ok "容器已移除，数据文件仍保留在: ${INSTALL_DIR}"
+    fi
+}
+
+# 菜单界面
+show_menu() {
+    clear
+    echo -e "${CYAN}======================================================${NC}"
+    echo -e "${GREEN}       CDT-Management Docker 一键管理脚本             ${NC}"
+    echo -e "${CYAN}======================================================${NC}"
+    echo -e " 项目地址: ${REPO_URL}"
+    echo -e " 安装路径: ${INSTALL_DIR}"
+    echo -e " 备份路径: ${BACKUP_DIR}"
+    echo -e " 面板端口: ${YELLOW}${HOST_PORT}${NC}"
+    echo -e "${CYAN}------------------------------------------------------${NC}"
+    echo -e "  ${GREEN}1.${NC} 一键安装部署 (端口 ${HOST_PORT})"
+    echo -e "  ${GREEN}2.${NC} 无损更新版本 (自动备份 + 保留全部数据)"
+    echo -e "  ${GREEN}3.${NC} 立即备份数据"
+    echo -e "  ${GREEN}4.${NC} 从备份恢复数据"
+    echo -e "  ${GREEN}5.${NC} 查看运行状态与实时日志"
+    echo -e "  ${GREEN}6.${NC} 重启服务"
+    echo -e "  ${RED}7.${NC} 卸载服务"
+    echo -e "  ${GREEN}0.${NC} 退出脚本"
+    echo -e "${CYAN}======================================================${NC}"
+    read -rp "请输入数字选项 [0-7]: " opt
+
+    case "$opt" in
+        1) install_app ;;
+        2) update_app ;;
+        3) backup_data "manual" ;;
+        4) restore_data ;;
+        5) cd "${INSTALL_DIR}" && docker compose ps && echo "" && docker compose logs --tail=50 -f ;;
+        6) cd "${INSTALL_DIR}" && docker compose restart && ok "服务已重启" ;;
+        7) uninstall_app ;;
+        0) exit 0 ;;
+        *) warn "无效选项，请重新输入" ;;
+    esac
+}
+
+# 支持命令行参数直接调用 (便于写入 crontab 定时备份)
+case "${1:-}" in
+    install)   install_app ;;
+    update)    update_app ;;
+    backup)    backup_data "cron" ;;
+    restore)   restore_data ;;
+    uninstall) uninstall_app ;;
+    *)         show_menu ;;
+esac
+EOF
+chmod +x /root/cdt.sh && /root/cdt.sh
