@@ -1,7 +1,7 @@
 cat << 'EOF' > /root/cdt.sh
 #!/usr/bin/env bash
 # ==============================================================================
-# CDT-Management 一键 Docker 部署 / 备份 / 无损更新管理脚本
+# CDT-Management 一键 Docker 部署 / 备份 / 无损更新管理脚本 (循环菜单增强版)
 # 适用项目: https://github.com/BeacherZ/cdt-management
 # 默认宿主机端口: 12333
 # ==============================================================================
@@ -24,10 +24,19 @@ NC='\033[0m'
 info()  { echo -e "${CYAN}[INFO]${NC} $1"; }
 ok()    { echo -e "${GREEN}[OK]${NC} $1"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
-err()   { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+err()   { echo -e "${RED}[ERROR]${NC} $1"; return 1; }
 
 # 检查 root 权限
-[[ $EUID -ne 0 ]] && err "请使用 root 用户运行此脚本 (sudo -i)"
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}[ERROR]${NC} 请使用 root 用户运行此脚本 (sudo -i)"
+    exit 1
+fi
+
+# 暂停并返回主菜单
+pause_back() {
+    echo ""
+    read -rp "按回车键 (Enter) 返回主菜单..." _
+}
 
 # 1. 环境检查与依赖安装
 check_env() {
@@ -51,6 +60,7 @@ check_env() {
 
     if ! docker compose version &>/dev/null; then
         err "当前 Docker 版本不支持 'docker compose' (V2)，请升级 Docker 或安装 docker-compose-plugin。"
+        return 1
     fi
 }
 
@@ -67,11 +77,9 @@ apply_port_config() {
 
     if [[ -n "$compose_file" ]]; then
         info "检测到配置文件 ${compose_file}，正在将宿主机端口修改为 ${HOST_PORT}..."
-        # 匹配形如 - "xxxx:yyyy" 或 - xxxx:yyyy 或 - 127.0.0.1:xxxx:yyyy，仅替换冒号左侧的宿主机端口为 12333
         sed -i -E "s/^([[:space:]]*-[[:space:]]*[\"']?)([0-9]+):([0-9]+[\"']?)/\1${HOST_PORT}:\3/g" "$compose_file"
         ok "端口映射已锁定为宿主机 ${HOST_PORT} 端口"
     else
-        # 若仓库仅提供 Dockerfile，自动生成标准 docker-compose.yml
         info "未检测到默认 compose 文件，正在根据 Dockerfile 自动生成 docker-compose.yml..."
         local internal_port="8080"
         if [[ -f "Dockerfile" ]]; then
@@ -118,7 +126,7 @@ start_containers() {
 
 # 4. 安装部署
 install_app() {
-    check_env
+    check_env || return 1
     mkdir -p "${BACKUP_DIR}"
 
     if [[ -d "${INSTALL_DIR}/.git" ]]; then
@@ -150,6 +158,7 @@ backup_data() {
     local tag="${1:-manual}"
     if [[ ! -d "${INSTALL_DIR}" ]]; then
         err "未找到安装目录 ${INSTALL_DIR}，无法备份！"
+        return 1
     fi
 
     mkdir -p "${BACKUP_DIR}"
@@ -158,7 +167,6 @@ backup_data() {
     local backup_file="${BACKUP_DIR}/${APP_NAME}_backup_${tag}_${timestamp}.tar.gz"
 
     info "正在打包备份持久化数据与配置文件..."
-    # 备份整个项目目录（排除 .git 历史对象以减小体积，完整保留 data/config/db/json 等所有数据）
     tar --exclude="${INSTALL_DIR}/.git" -czf "${backup_file}" -C "$(dirname "${INSTALL_DIR}")" "$(basename "${INSTALL_DIR}")"
 
     ok "数据备份完成！备份文件路径: ${backup_file}"
@@ -167,9 +175,10 @@ backup_data() {
 
 # 6. 无损更新（自动备份 -> 保护持久化数据 -> 拉取更新 -> 恢复端口 -> 重建容器）
 update_app() {
-    check_env
+    check_env || return 1
     if [[ ! -d "${INSTALL_DIR}/.git" ]]; then
         err "未检测到已安装的 ${INSTALL_DIR}，请先执行【1. 安装部署】。"
+        return 1
     fi
 
     info "【第 1/4 步】更新前自动备份当前数据..."
@@ -178,7 +187,6 @@ update_app() {
     info "【第 2/4 步】保护持久化数据目录并同步最新源码..."
     local tmp_data_dir="/tmp/${APP_NAME}_data_preserve_$$"
     mkdir -p "${tmp_data_dir}"
-    # 将可能存在的数据库、配置、数据文件夹暂存一份，防止 git reset 覆盖任何已跟踪的同名默认配置
     cd "${INSTALL_DIR}"
     for item in data config logs db storage *.db *.sqlite *.sqlite3 *.json .env; do
         if [[ -e "$item" && "$item" != "package.json" && "$item" != "package-lock.json" ]]; then
@@ -191,7 +199,6 @@ update_app() {
     branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "main")
     git reset --hard "origin/${branch}"
 
-    # 还原用户的持久化数据与配置
     cp -af "${tmp_data_dir}/." "${INSTALL_DIR}/" 2>/dev/null || true
     rm -rf "${tmp_data_dir}"
 
@@ -230,6 +237,7 @@ restore_data() {
 
     if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#backups[@]} )); then
         err "无效的序号！"
+        return 1
     fi
 
     local selected_backup="${backups[$((choice-1))]}"
@@ -248,7 +256,21 @@ restore_data() {
     ok "数据已成功恢复并重新启动服务！"
 }
 
-# 8. 卸载服务
+# 8. 查看状态与日志（支持 Ctrl+C 退回主菜单而不退出脚本）
+view_logs() {
+    if [[ ! -d "${INSTALL_DIR}" ]]; then
+        err "未找到安装目录 ${INSTALL_DIR}，请先安装！"
+        return 1
+    fi
+    cd "${INSTALL_DIR}"
+    docker compose ps
+    echo -e "\n${YELLOW}提示：正在显示实时日志，按 Ctrl+C 可停止查看并返回主菜单...${NC}\n"
+    trap 'echo -e "\n${CYAN}[INFO] 已停止日志输出${NC}"' INT
+    docker compose logs --tail=50 -f || true
+    trap - INT
+}
+
+# 9. 卸载服务
 uninstall_app() {
     warn "即将停止并移除 ${APP_NAME} 容器。"
     read -rp "确认卸载容器吗？(y/N): " confirm
@@ -260,7 +282,7 @@ uninstall_app() {
 
     read -rp "是否在删除安装目录前先执行一次最终数据备份？(Y/n): " do_bak
     if [[ "${do_bak,,}" != "n" ]]; then
-        backup_data "before_uninstall"
+        backup_data "before_uninstall" || true
     fi
 
     read -rp "是否彻底删除安装目录 ${INSTALL_DIR}（备份目录 ${BACKUP_DIR} 仍会保留）？(y/N): " del_dir
@@ -272,42 +294,51 @@ uninstall_app() {
     fi
 }
 
-# 菜单界面
+# 循环主菜单界面
 show_menu() {
-    clear
-    echo -e "${CYAN}======================================================${NC}"
-    echo -e "${GREEN}       CDT-Management Docker 一键管理脚本             ${NC}"
-    echo -e "${CYAN}======================================================${NC}"
-    echo -e " 项目地址: ${REPO_URL}"
-    echo -e " 安装路径: ${INSTALL_DIR}"
-    echo -e " 备份路径: ${BACKUP_DIR}"
-    echo -e " 面板端口: ${YELLOW}${HOST_PORT}${NC}"
-    echo -e "${CYAN}------------------------------------------------------${NC}"
-    echo -e "  ${GREEN}1.${NC} 一键安装部署 (端口 ${HOST_PORT})"
-    echo -e "  ${GREEN}2.${NC} 无损更新版本 (自动备份 + 保留全部数据)"
-    echo -e "  ${GREEN}3.${NC} 立即备份数据"
-    echo -e "  ${GREEN}4.${NC} 从备份恢复数据"
-    echo -e "  ${GREEN}5.${NC} 查看运行状态与实时日志"
-    echo -e "  ${GREEN}6.${NC} 重启服务"
-    echo -e "  ${RED}7.${NC} 卸载服务"
-    echo -e "  ${GREEN}0.${NC} 退出脚本"
-    echo -e "${CYAN}======================================================${NC}"
-    read -rp "请输入数字选项 [0-7]: " opt
+    while true; do
+        clear
+        echo -e "${CYAN}======================================================${NC}"
+        echo -e "${GREEN}       CDT-Management Docker 一键管理脚本             ${NC}"
+        echo -e "${CYAN}======================================================${NC}"
+        echo -e " 项目地址: ${REPO_URL}"
+        echo -e " 安装路径: ${INSTALL_DIR}"
+        echo -e " 备份路径: ${BACKUP_DIR}"
+        echo -e " 面板端口: ${YELLOW}${HOST_PORT}${NC}"
+        echo -e "${CYAN}------------------------------------------------------${NC}"
+        echo -e "  ${GREEN}1.${NC} 一键安装部署 (端口 ${HOST_PORT})"
+        echo -e "  ${GREEN}2.${NC} 无损更新版本 (自动备份 + 保留全部数据)"
+        echo -e "  ${GREEN}3.${NC} 立即备份数据"
+        echo -e "  ${GREEN}4.${NC} 从备份恢复数据"
+        echo -e "  ${GREEN}5.${NC} 查看运行状态与实时日志"
+        echo -e "  ${GREEN}6.${NC} 重启服务"
+        echo -e "  ${RED}7.${NC} 卸载服务"
+        echo -e "  ${GREEN}0.${NC} 退出脚本"
+        echo -e "${CYAN}======================================================${NC}"
+        read -rp "请输入数字选项 [0-7]: " opt
 
-    case "$opt" in
-        1) install_app ;;
-        2) update_app ;;
-        3) backup_data "manual" ;;
-        4) restore_data ;;
-        5) cd "${INSTALL_DIR}" && docker compose ps && echo "" && docker compose logs --tail=50 -f ;;
-        6) cd "${INSTALL_DIR}" && docker compose restart && ok "服务已重启" ;;
-        7) uninstall_app ;;
-        0) exit 0 ;;
-        *) warn "无效选项，请重新输入" ;;
-    esac
+        case "$opt" in
+            1) install_app || true; pause_back ;;
+            2) update_app || true; pause_back ;;
+            3) backup_data "manual" || true; pause_back ;;
+            4) restore_data || true; pause_back ;;
+            5) view_logs || true; pause_back ;;
+            6)
+                if [[ -d "${INSTALL_DIR}" ]]; then
+                    cd "${INSTALL_DIR}" && docker compose restart && ok "服务已重启"
+                else
+                    err "未找到安装目录 ${INSTALL_DIR}" || true
+                fi
+                pause_back
+                ;;
+            7) uninstall_app || true; pause_back ;;
+            0) info "已退出管理脚本。"; exit 0 ;;
+            *) warn "无效选项，请重新输入"; sleep 1 ;;
+        esac
+    done
 }
 
-# 支持命令行参数直接调用 (便于写入 crontab 定时备份)
+# 支持命令行参数直接调用 (便于写入 crontab 定时备份，不进入循环)
 case "${1:-}" in
     install)   install_app ;;
     update)    update_app ;;
