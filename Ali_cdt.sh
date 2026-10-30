@@ -39,6 +39,52 @@ pause_back() {
     read -rp "按回车键 (Enter) 返回主菜单..." _
 }
 
+# 获取已安装版本号
+get_installed_version() {
+    if [[ ! -d "${INSTALL_DIR}" ]]; then
+        echo -e "${RED}未安装${NC}"
+        return
+    fi
+
+    local ver=""
+    local commit=""
+    local commit_date=""
+
+    # 1. 尝试从常见版本文件中读取显式版本号
+    if [[ -f "${INSTALL_DIR}/VERSION" ]]; then
+        ver=$(head -n 1 "${INSTALL_DIR}/VERSION" | tr -d '[:space:]')
+    elif [[ -f "${INSTALL_DIR}/version.txt" ]]; then
+        ver=$(head -n 1 "${INSTALL_DIR}/version.txt" | tr -d '[:space:]')
+    elif [[ -f "${INSTALL_DIR}/package.json" ]]; then
+        ver=$(grep -m1 -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "${INSTALL_DIR}/package.json" | cut -d'"' -f4 || true)
+    fi
+
+    # 2. 尝试从 Git 仓库获取 Tag / Commit 信息
+    if [[ -d "${INSTALL_DIR}/.git" ]] && command -v git &>/dev/null; then
+        local git_tag
+        git_tag=$(git -C "${INSTALL_DIR}" describe --tags --abbrev=0 2>/dev/null || true)
+        [[ -z "$ver" && -n "$git_tag" ]] && ver="$git_tag"
+
+        commit=$(git -C "${INSTALL_DIR}" rev-parse --short HEAD 2>/dev/null || true)
+        commit_date=$(git -C "${INSTALL_DIR}" log -1 --format="%cd" --date=short 2>/dev/null || true)
+    fi
+
+    # 3. 格式化组合输出
+    if [[ -n "$ver" && -n "$commit" ]]; then
+        if [[ "$ver" == "$commit" ]]; then
+            echo -e "${GREEN}${ver}${NC} (${commit_date})"
+        else
+            echo -e "${GREEN}${ver}${NC} (Commit: ${YELLOW}${commit}${NC}, ${commit_date})"
+        fi
+    elif [[ -n "$ver" ]]; then
+        echo -e "${GREEN}${ver}${NC}"
+    elif [[ -n "$commit" ]]; then
+        echo -e "${GREEN}Commit: ${commit}${NC} (${commit_date})"
+    else
+        echo -e "${YELLOW}已安装 (未知版本)${NC}"
+    fi
+}
+
 # 自动清理旧备份，仅保留最新的 MAX_BACKUPS (3) 份
 clean_old_backups() {
     mkdir -p "${BACKUP_DIR}"
@@ -164,6 +210,7 @@ install_app() {
     echo ""
     ok "================================================================"
     ok " CDT-Management 安装成功！"
+    ok " 当前版本: $(get_installed_version)"
     ok " 访问地址: http://${ip}:${HOST_PORT}"
     ok " 安装目录: ${INSTALL_DIR}"
     ok " 备份目录: ${BACKUP_DIR} (最多保留 ${MAX_BACKUPS} 份)"
@@ -201,6 +248,10 @@ update_app() {
         return 1
     fi
 
+    local old_ver
+    old_ver=$(get_installed_version)
+    info "更新前版本: ${old_ver}"
+
     info "【第 1/4 步】更新前自动备份当前数据..."
     backup_data "pre_update"
 
@@ -214,7 +265,7 @@ update_app() {
         fi
     done
 
-    git fetch --all
+    git fetch --all --tags
     local branch
     branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "main")
     git reset --hard "origin/${branch}"
@@ -229,8 +280,12 @@ update_app() {
     start_containers
     docker image prune -f >/dev/null 2>&1 || true
 
+    local new_ver
+    new_ver=$(get_installed_version)
+
     ok "================================================================"
     ok " CDT-Management 已成功更新至最新版本，所有数据完好保留！"
+    ok " 版本变更: ${old_ver} -> ${new_ver}"
     ok "================================================================"
 }
 
@@ -323,11 +378,15 @@ show_menu() {
         clear
         local cur_backups
         cur_backups=$(ls -1 "${BACKUP_DIR}"/${APP_NAME}_backup_*.tar.gz 2>/dev/null | wc -l)
+        local current_version
+        current_version=$(get_installed_version)
+
         echo -e "${CYAN}==============================================================${NC}"
         echo -e "${GREEN}            CDT-Management Docker 一键管理脚本                 ${NC}"
         echo -e "${CYAN}==============================================================${NC}"
         echo -e " 项目地址: ${REPO_URL}"
         echo -e " 安装路径: ${INSTALL_DIR}"
+        echo -e " 当前版本: ${current_version}"
         echo -e " 备份路径: ${BACKUP_DIR} (当前: ${YELLOW}${cur_backups}/${MAX_BACKUPS}${NC} 份)"
         echo -e " 面板端口: ${YELLOW}${HOST_PORT}${NC}"
         echo -e "${CYAN}--------------------------------------------------------------${NC}"
